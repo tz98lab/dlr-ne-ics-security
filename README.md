@@ -49,9 +49,6 @@ dlr-avi-ics-security/
 ├── requirements.txt              # Python dependencies
 └── README.md                     # This file
 ```
-
----
-
 ## Installation
 
 ### Prerequisites
