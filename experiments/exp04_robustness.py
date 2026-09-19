@@ -1,24 +1,49 @@
 #!/usr/bin/env python3
 """
 ================================================================================
-Exp. 4: Game-Theoretic Robustness
-Validates Corollary 1:  ||V(π_D) - V(π̃_D)||_∞ ≤ L_κ ||ΔS||_F
-                         L_κ = C_robust · κ(S)
-                         L_κ ≤ C_robust · exp( R(S)/(√2 σ_r(S)^2) )
-================================================================================
+Exp. 4 (v2): Game-Theoretic Robustness — Corollary 1 verification within a
+             single network family
 
-This script:
-1. Trains DLR-AVI to convergence with varying spectral regularization β.
-2. Injects controlled Frobenius-norm perturbations ΔS on the core matrix.
-3. Measures value-function deviation and condition number.
-4. Verifies the linear relation ΔV ∝ κ(S) and the compression effect of β.
+Corollary 1 states a *per-network* bound:
+    ||V(π_D) - V(π̃_D)||_∞ ≤ L_κ ||ΔS||_F ,   L_κ = C_robust · κ(S)
+
+The constant C_robust depends on the trained network geometry (w_out, L_φ,
+R_X, ...) and is therefore NOT expected to be invariant across different
+regularization levels β (v1 measured this cross-β regime).
+
+This v2 script isolates the quantitative content of Corollary 1:
+  * β is FIXED (operating point) → the network geometry statistics are
+    (approximately) held fixed, so C_robust should be roughly constant;
+  * only the trained core matrix S varies — across ranks r and seeds;
+  * we then test whether L_κ scales proportionally with κ(S) across the
+    resulting family of networks.
+
+Output:
+  * exp4_robustness.png       — two panels:
+      Left : ΔV vs ||ΔS||_F (linearity per network, fixed β)
+      Right: fitted L_κ vs κ(S) across the network family, with linear fit
+             slope = empirical C_robust  (expect: positive, through origin)
+  * results_data/exp4_results.json — all raw measurements + fit statistics
+================================================================================
 """
 
+import json
+import os
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.linalg import qr, svd, norm
 import warnings
 warnings.filterwarnings('ignore')
+
+# ==============================================================================
+# 0. Experiment Configuration
+# ==============================================================================
+
+FIXED_BETA = 0.1          # operating point: β fixed for the whole experiment
+RANKS = [10, 20, 40, 60]  # retraction ranks r (varies κ across the family)
+SEEDS = [42, 7]           # independent training runs per rank
+TRAIN_ITERS = 80
+PERTURBATION_NORMS = [0.005, 0.01, 0.02, 0.05]
 
 # ==============================================================================
 # 1. Environment (same low-rank coupling structure as Exp. 2–3)
@@ -128,7 +153,6 @@ class LowRankValueNN:
         return self.U @ self.S @ self.V.T
 
     def copy(self):
-        """Deep copy."""
         net = LowRankValueNN(self.n, self.m, self.r)
         net.U = self.U.copy()
         net.V = self.V.copy()
@@ -137,12 +161,12 @@ class LowRankValueNN:
         return net
 
 # ==============================================================================
-# 3. DLR-AVI Trainer (simplified, no basis augmentation for speed)
+# 3. DLR-NE Trainer (simplified, no basis augmentation for speed)
 # ==============================================================================
 
-class DLRAVITrainer:
+class DLRNETrainer:
     def __init__(self, env: PowerSystemEnv, n: int, m: int, r: int,
-                 gamma: float = 0.95, lr: float = 0.02, beta: float = 0.01,
+                 gamma: float = 0.95, lr: float = 0.02, beta: float = 0.1,
                  s_star: int = 10):
         self.env = env
         self.n = n
@@ -177,21 +201,17 @@ class DLRAVITrainer:
         N = X_batch.shape[0]
         Y = np.array([self.bellman_target(x) for x in X_batch])
 
-        # Forward
         Z = X_batch @ self.value.V
         H = Z @ self.value.S.T
         G = np.tanh(H @ self.value.U.T)
         v_pred = G @ self.value.w_out
 
-        # Backward
         delta = v_pred - Y
         Phi_prime = 1 - G**2
         delta_h = (delta[:, None] * self.value.w_out[None, :]) * Phi_prime
 
         grad_w = G.T @ delta / N
         grad_S = (self.value.U.T @ delta_h.T) @ (X_batch @ self.value.V) / N
-
-        # Spectral regularization
         grad_S += self.beta * self.grad_spectral(self.value.S)
 
         self.value.w_out -= self.lr * grad_w
@@ -210,24 +230,21 @@ class DLRAVITrainer:
 # ==============================================================================
 
 class GreedyNashPolicy:
-    def __init__(self, env: PowerSystemEnv, n_action_samples: int = 20):
+    def __init__(self, env: PowerSystemEnv, n_action_samples: int = 15):
         self.env = env
         self.n_action_samples = n_action_samples
         self.a_grid = np.linspace(0, 1, n_action_samples)
         self.d_grid = np.linspace(0, 1, n_action_samples)
 
     def extract(self, x: np.ndarray, value_fn: LowRankValueNN) -> tuple:
-        """Return (a_star, d_star) for state x."""
         best_val = -np.inf
         best_pair = (np.zeros(self.env.cfg.ra), np.zeros(self.env.cfg.rd))
-
         for d_val in self.d_grid:
             d = np.ones(self.env.cfg.rd) * d_val
             worst_for_d = np.inf
             worst_a = None
             for a_val in self.a_grid:
                 a = np.ones(self.env.cfg.ra) * a_val
-                # One-step Q (single-sample MC for speed)
                 r = self.env.reward(x, a, d)
                 x_next = self.env.step(x, a, d)
                 q = r + 0.95 * value_fn.forward(x_next)
@@ -237,144 +254,155 @@ class GreedyNashPolicy:
             if worst_for_d > best_val:
                 best_val = worst_for_d
                 best_pair = (worst_a, d)
-
         return best_pair
 
-    def evaluate_policy(self, value_fn: LowRankValueNN, n_test: int = 500) -> float:
-        """Average utility over test states."""
+    def evaluate_policy(self, value_fn: LowRankValueNN, n_test: int = 200) -> float:
         X_test = self.env.sample_states(n_test)
         utilities = []
         for x in X_test:
             a, d = self.extract(x, value_fn)
-            # Rollout for 5 steps to estimate utility
             x_roll = x.copy()
             util = 0.0
             for t in range(5):
                 r = self.env.reward(x_roll, a, d)
                 util += (0.95**t) * r
                 x_roll = self.env.step(x_roll, a, d)
-                # Re-extract policy at new state
                 a, d = self.extract(x_roll, value_fn)
             utilities.append(util)
         return np.mean(utilities)
 
 # ==============================================================================
-# 5. Perturbation and Evaluation
+# 5. Perturbation, Condition Number, Sensitivity Fit
 # ==============================================================================
 
 def inject_perturbation(value_fn: LowRankValueNN, delta_norm: float) -> LowRankValueNN:
-    """Create perturbed network with ||ΔS||_F = delta_norm."""
     perturbed = value_fn.copy()
-    # Random Frobenius-norm perturbation on S
     Delta = np.random.randn(*perturbed.S.shape)
     Delta = Delta / (norm(Delta, 'fro') + 1e-12) * delta_norm
     perturbed.S += Delta
     return perturbed
 
-def condition_number(S: np.ndarray) -> float:
+def core_spectrum_stats(S: np.ndarray) -> dict:
     s = svd(S, compute_uv=False)
-    return s[0] / max(s[-1], 1e-12)
+    alpha_sq = np.trace(S.T @ S) / S.shape[0]
+    return {
+        'kappa': s[0] / max(s[-1], 1e-12),
+        'sigma_r': s[-1],
+        'sigma_1': s[0],
+        'R_spectral': norm(S.T @ S - alpha_sq * np.eye(S.shape[0]), 'fro'),
+    }
+
+def fit_L_kappa(delta_norms: list, value_deviations: list) -> tuple:
+    """Origin-constrained linear fit:  L_κ = argmin_L Σ (ΔV_i - L·||ΔS||_i)² .
+    Corollary 1 predicts ΔV = L_κ ||ΔS||_F (homogeneous), hence fit through origin."""
+    x = np.asarray(delta_norms, dtype=float)
+    y = np.asarray(value_deviations, dtype=float)
+    L = float((x @ y) / (x @ x))
+    y_hat = L * x
+    ss_res = float(((y - y_hat) ** 2).sum())
+    ss_tot = float(((y - y.mean()) ** 2).sum())
+    R2 = 1.0 - ss_res / ss_tot if ss_tot > 1e-12 else float('nan')
+    return L, R2
 
 # ==============================================================================
-# 6. Main Experiment
+# 6. Main Experiment — single network at fixed β
 # ==============================================================================
 
-def run_robustness_experiment(cfg: PowerSystemConfig, beta: float, K: int = 100):
-    """Train DLR-AVI with given beta, then test robustness."""
-    np.random.seed(cfg.seed)
+def run_single(rank: int, seed: int, beta: float = FIXED_BETA, K: int = TRAIN_ITERS) -> dict:
+    """Train one DLR-NE network (rank r, seed) at the fixed operating point β,
+    then measure its sensitivity L_κ and condition number κ(S)."""
+    cfg = PowerSystemConfig()
+    cfg.seed = seed
+    np.random.seed(seed)
     env = PowerSystemEnv(cfg)
 
-    print(f"\n  === Training with β = {beta} ===")
-    trainer = DLRAVITrainer(env, cfg.n, cfg.m, r=20, gamma=0.95, lr=0.02, beta=beta, s_star=10)
+    print(f"\n  === r = {rank}, seed = {seed}, β = {beta} ===")
+    trainer = DLRNETrainer(env, cfg.n, cfg.m, r=rank, gamma=0.95, lr=0.02, beta=beta, s_star=10)
     trainer.train(K=K, N_b=512)
 
-    # Evaluate base policy utility
     policy = GreedyNashPolicy(env, n_action_samples=15)
     U_base = policy.evaluate_policy(trainer.value, n_test=200)
 
-    # Condition number of base S
-    kappa_base = condition_number(trainer.value.S)
-    print(f"  Base utility: {U_base:.4f}, Base κ(S): {kappa_base:.2f}")
+    stats = core_spectrum_stats(trainer.value.S)
+    print(f"  Base utility: {U_base:.4f}, κ(S) = {stats['kappa']:.2f}, "
+          f"σ_r = {stats['sigma_r']:.4f}, R = {stats['R_spectral']:.4f}")
 
-    # Test perturbations
-    delta_norms = [0.001, 0.005, 0.01, 0.05, 0.1]
-    results = {
-        'beta': beta,
-        'kappa_base': kappa_base,
-        'delta_norms': [],
-        'utility_deviations': [],
-        'value_deviations': []
+    res = {
+        'rank': rank, 'seed': seed, 'beta': beta,
+        'kappa': stats['kappa'], 'sigma_r': stats['sigma_r'],
+        'sigma_1': stats['sigma_1'], 'R_spectral': stats['R_spectral'],
+        'w_out_norm': float(norm(trainer.value.w_out)),
+        'base_utility': U_base,
+        'delta_norms': [], 'utility_deviations': [], 'value_deviations': [],
     }
 
-    for dn in delta_norms:
+    X_test = env.sample_states(500)
+    V_base = np.array([trainer.value.forward(x) for x in X_test])
+
+    for dn in PERTURBATION_NORMS:
         perturbed = inject_perturbation(trainer.value, dn)
         U_pert = policy.evaluate_policy(perturbed, n_test=200)
-
-        # Value function deviation (sup-norm approximation on test set)
-        X_test = env.sample_states(500)
-        V_base = np.array([trainer.value.forward(x) for x in X_test])
         V_pert = np.array([perturbed.forward(x) for x in X_test])
         delta_V = np.max(np.abs(V_base - V_pert))
 
-        results['delta_norms'].append(dn)
-        results['utility_deviations'].append(abs(U_base - U_pert))
-        results['value_deviations'].append(delta_V)
-
+        res['delta_norms'].append(dn)
+        res['utility_deviations'].append(abs(U_base - U_pert))
+        res['value_deviations'].append(delta_V)
         print(f"    ||ΔS||={dn:.3f}: ΔU={abs(U_base-U_pert):.4f}, ΔV={delta_V:.4f}")
 
-    return results
+    L_kappa, R2 = fit_L_kappa(res['delta_norms'], res['value_deviations'])
+    res['L_kappa'] = L_kappa
+    res['linearity_R2'] = R2
+    print(f"  => L_κ = {L_kappa:.4f}  (fit R² = {R2:.4f}),  κ(S) = {stats['kappa']:.2f}")
+    return res
 
 # ==============================================================================
 # 7. Visualization
 # ==============================================================================
 
-def plot_exp4(results_list: list):
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4.5))
+def plot_exp4(results_list: list, fit: dict):
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.8))
 
-    # Left: value deviation vs. perturbation norm
+    # ---- Left: ΔV vs ||ΔS||_F — per-network linearity at fixed β ----
     ax = axes[0]
+    cmap = plt.cm.viridis(np.linspace(0.15, 0.85, len(RANKS)))
+    rank_colors = {r: cmap[i] for i, r in enumerate(RANKS)}
     for res in results_list:
-        label = f"$\\beta={res['beta']:.2f}, \\kappa={res['kappa_base']:.1f}$"
-        ax.plot(res['delta_norms'], res['value_deviations'], 'o-', markersize=8, linewidth=2, label=label)
+        label = f"$r={res['rank']}$, seed${res['seed']}$"
+        ax.plot(res['delta_norms'], res['value_deviations'], 'o-', markersize=6,
+                linewidth=1.8, color=rank_colors[res['rank']],
+                alpha=0.55 if res['seed'] != SEEDS[0] else 1.0, label=label)
     ax.set_xlabel(r'Perturbation norm $\|\Delta S\|_F$', fontsize=12)
     ax.set_ylabel(r'Value deviation $\Delta V$', fontsize=12)
-    ax.set_title('Robustness: Value Deviation (Corollary 1)', fontsize=13, fontweight='bold')
-    ax.legend(fontsize=10)
+    ax.set_title(rf'Per-Network Linearity ($\beta$ = {FIXED_BETA} fixed)', fontsize=13, fontweight='bold')
+    ax.legend(fontsize=8, ncol=2)
     ax.grid(True, alpha=0.3)
 
-    # Middle: condition number vs. beta
+    # ---- Right: L_κ vs κ(S) across the network family — Corollary 1 ----
     ax = axes[1]
-    betas = [res['beta'] for res in results_list]
-    kappas = [res['kappa_base'] for res in results_list]
-    ax.semilogy(betas, kappas, 'o-', color='#A23B72', markersize=10, linewidth=2)
-    ax.set_xlabel(r'Spectral regularization weight $\beta$', fontsize=12)
-    ax.set_ylabel(r'Condition number $\kappa(S)$', fontsize=12)
-    ax.set_title('Condition Number vs. Regularization', fontsize=13, fontweight='bold')
-    ax.grid(True, alpha=0.3, which='both')
-
-    # Right: fitted L_kappa vs. kappa(S)
-    ax = axes[2]
-    L_kappas = []
-    kappa_vals = []
-    for res in results_list:
-        # Linear fit slope: delta_V / ||ΔS||_F
-        slopes = [dv / max(dn, 1e-6) for dv, dn in zip(res['value_deviations'], res['delta_norms'])]
-        L_kappa = np.mean(slopes[1:])  # exclude smallest perturbation (noisy)
-        L_kappas.append(L_kappa)
-        kappa_vals.append(res['kappa_base'])
-
-    ax.plot(kappa_vals, L_kappas, 'o-', color='#2E86AB', markersize=10, linewidth=2)
-    # Linear reference
-    if len(kappa_vals) > 1:
-        coeffs = np.polyfit(kappa_vals, L_kappas, 1)
-        x_ref = np.linspace(min(kappa_vals), max(kappa_vals), 100)
-        ax.plot(x_ref, np.polyval(coeffs, x_ref), 'k--', alpha=0.5, label=f'Linear fit: slope={coeffs[0]:.2f}')
+    kappas = np.array([res['kappa'] for res in results_list])
+    Ls = np.array([res['L_kappa'] for res in results_list])
+    for r in RANKS:
+        idx = [i for i, res in enumerate(results_list) if res['rank'] == r]
+        ax.plot(kappas[idx], Ls[idx], 'o', markersize=10, color=rank_colors[r],
+                label=f'$r={r}$')
+    # Linear fit L_κ = C_robust · κ(S)
+    C_hat, intercept = np.polyfit(kappas, Ls, 1)
+    x_ref = np.linspace(kappas.min(), kappas.max(), 100)
+    ax.plot(x_ref, np.polyval([C_hat, intercept], x_ref), 'k--', alpha=0.6,
+            label=f'fit: $L_\\kappa$ = {C_hat:.5f}·$\\kappa$ {"+" if intercept>=0 else "−"} {abs(intercept):.4f}')
     ax.set_xlabel(r'Condition number $\kappa(S)$', fontsize=12)
-    ax.set_ylabel(r'Fitted $L_\kappa$', fontsize=12)
-    ax.set_title(r'$L_\kappa \propto \kappa(S)$ Verification', fontsize=13, fontweight='bold')
-    ax.legend(fontsize=10)
+    ax.set_ylabel(r'Fitted sensitivity $L_\kappa$', fontsize=12)
+    ax.set_title(rf'$L_\kappa \propto \kappa(S)$ within a network family ($\beta$ = {FIXED_BETA})',
+                 fontsize=13, fontweight='bold')
+    ax.legend(fontsize=9)
     ax.grid(True, alpha=0.3)
 
+    os.makedirs('results_data', exist_ok=True)
+    with open('results_data/exp4_results.json', 'w') as f:
+        json.dump({'config': {'fixed_beta': FIXED_BETA, 'ranks': RANKS, 'seeds': SEEDS,
+                              'perturbation_norms': PERTURBATION_NORMS},
+                   'runs': results_list, 'family_fit': fit}, f, indent=2)
     plt.tight_layout()
     plt.savefig('exp4_robustness.png', dpi=300, bbox_inches='tight')
     plt.show()
@@ -386,23 +414,32 @@ def plot_exp4(results_list: list):
 
 def main():
     print("=" * 70)
-    print("  Exp. 4: Game-Theoretic Robustness")
-    print("  Validates Corollary 1 (Condition-Number-Controlled Robustness)")
+    print("  Exp. 4 (v2): Game-Theoretic Robustness")
+    print(f"  Fixed β = {FIXED_BETA}, ranks r = {RANKS}, seeds = {SEEDS}")
+    print("  Tests  L_κ = C_robust · κ(S)  within a single network family")
     print("=" * 70)
 
-    cfg = PowerSystemConfig()
-
-    betas = [0.0, 0.01, 0.1, 1.0]
     results_list = []
+    for r in RANKS:
+        for seed in SEEDS:
+            results_list.append(run_single(rank=r, seed=seed))
 
-    for beta in betas:
-        res = run_robustness_experiment(cfg, beta=beta, K=80)
-        results_list.append(res)
+    # Family-level fit: L_κ against κ(S) across all trained networks
+    kappas = np.array([res['kappa'] for res in results_list])
+    Ls = np.array([res['L_kappa'] for res in results_list])
+    C_hat, intercept = np.polyfit(kappas, Ls, 1)
+    ss_res = float(((Ls - np.polyval([C_hat, intercept], kappas)) ** 2).sum())
+    ss_tot = float(((Ls - Ls.mean()) ** 2).sum())
+    R2 = 1.0 - ss_res / ss_tot
+    fit = {'C_robust_empirical': float(C_hat), 'intercept': float(intercept),
+           'family_fit_R2': float(R2)}
+    print("\n  === Family-level fit: L_κ = C·κ(S) ===")
+    print(f"  C_robust (empirical) = {C_hat:.5f},  intercept = {intercept:.4f},  R² = {R2:.4f}")
 
-    plot_exp4(results_list)
+    plot_exp4(results_list, fit)
 
     print("\n" + "=" * 70)
-    print("  Exp. 4 completed successfully.")
+    print("  Exp. 4 (v2) completed successfully.")
     print("=" * 70)
 
 if __name__ == '__main__':
