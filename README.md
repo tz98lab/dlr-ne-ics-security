@@ -1,4 +1,4 @@
-# DLR-AVI for ICS Security Games
+# DLR-NE for ICS Security Games
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -9,7 +9,7 @@
 
 ## Overview
 
-This repository contains the implementation and experimental validation of the **Dynamical Low-Rank Approximate Value Iteration (DLR-AVI)** algorithm for computing Nash equilibria in high-dimensional Industrial Control System (ICS) security games.
+This repository contains the implementation and experimental validation of the **Dynamical Low-Rank Approximate Value Iteration (DLR-NE)** algorithm for computing Nash equilibria in high-dimensional Industrial Control System (ICS) security games.
 
 The strategic interaction between **Advanced Persistent Threats (APTs)** and **Moving Target Defenses (MTDs)** is modeled as a two-player zero-sum stochastic game over a continuous state space of dimension $n \sim 10^3$–$10^4$. The key insight is that the physical low-rank coupling of attack and defense channels (a structural property inherent to ICS network topology) enables tractable low-rank neural-network approximation of the equilibrium value function, reducing per-iteration complexity from $\mathcal{O}(n^3)$ to $\mathcal{O}(nr^2)$.
 
@@ -18,7 +18,7 @@ The strategic interaction between **Advanced Persistent Threats (APTs)** and **M
 | Theorem | Statement | Experiment |
 |:---|:---|:---|
 | **Theorem 1** | Global low-rank approximation error bound for the optimal value function $V^*$ | [Exp. 1](#exp1) |
-| **Theorem 2** | Geometric convergence of DLR-AVI with explicit steady-state error decomposition | [Exp. 2](#exp2) |
+| **Theorem 2** | Geometric convergence of DLR-NE with explicit steady-state error decomposition | [Exp. 2](#exp2) |
 | **Theorem 3** | Per-iteration complexity $\mathcal{O}(nr^2)$ and speedup $\Theta(n/r^2)$ over full-rank baselines | [Exp. 3](#exp3) |
 | **Corollary 1** | Game-theoretic robustness: equilibrium sensitivity is controlled by the condition number $\kappa(S)$ | [Exp. 4](#exp4) |
 
@@ -27,17 +27,17 @@ The strategic interaction between **Advanced Persistent Threats (APTs)** and **M
 ## Repository Structure
 
 ```
-dlr-avi-ics-security/
+DLR-NE-ics-security/
 ├── src/                          # Core algorithmic modules
 │   ├── environment.py            # Synthetic nonlinear power-system dynamics
 │   ├── networks.py               # Low-rank and full-rank neural networks
 │   ├── bellman.py                # Bellman operator and greedy Nash policy extractor
-│   ├── dlra_vi.py                # Algorithm 1: DLR-AVI
+│   ├── dlra_vi.py                # Algorithm 1: DLR-NE
 │   └── utils.py                  # FLOPs accounting, EYM error, metrics
 │
 ├── experiments/                  # Experimental scripts (one per theorem)
 │   ├── exp01_truncation_error.py     # Theorem 1: Low-rank truncation error
-│   ├── exp02_convergence.py          # Theorem 2: Convergence of DLR-AVI
+│   ├── exp02_convergence.py          # Theorem 2: Convergence of DLR-NE
 │   ├── exp03_complexity.py           # Theorem 3: Computational complexity
 │   ├── exp04_robustness.py           # Corollary 1: Game-theoretic robustness
 │   ├── exp05_tradeoff.py             # Compression-accuracy Pareto frontier
@@ -60,8 +60,8 @@ dlr-avi-ics-security/
 
 ```bash
 # Clone the repository
-git clone https://github.com/tz98lab/dlr-avi-ics-security.git
-cd dlr-avi-ics-security
+git clone https://github.com/tz98lab/DLR-NE-ics-security.git
+cd DLR-NE-ics-security
 
 # Create a virtual environment (recommended)
 python -m venv venv
@@ -97,7 +97,7 @@ python experiments/exp01_truncation_error.py
 **Output**: `results/figures/exp1_truncation_error.png`  
 **Expected**: Measured error (blue circles) tracks the theoretical bound $L_\phi \|w_{\mathrm{out}}^*\|_2 R_{\mathcal{X}} \epsilon_{\mathrm{EYM}}(r)$ (purple dashed line); singular-value spectrum shows rapid decay.
 
-### <a name="exp2"></a> Exp. 2: Convergence of DLR-AVI (Theorem 2)
+### <a name="exp2"></a> Exp. 2: Convergence of DLR-NE (Theorem 2)
 
 Validates geometric convergence with rate $\gamma$ and the explicit steady-state error neighborhood $\varepsilon_{\mathrm{total}}/(1-\gamma)$.
 
@@ -117,7 +117,7 @@ python experiments/exp03_complexity.py
 ```
 
 **Output**: `results/figures/exp3_complexity.png`  
-**Expected**: DLR-AVI scales linearly in $n$ (slope 1 in log-log), FC-NN scales quadratically (slope 2); measured speedup $\approx 20\times$ at $n=2000, r=10$.
+**Expected**: DLR-NE scales linearly in $n$ (slope 1 in log-log), FC-NN scales quadratically (slope 2); measured speedup $\approx 20\times$ at $n=2000, r=10$.
 
 ### <a name="exp4"></a> Exp. 4: Game-Theoretic Robustness (Corollary 1)
 
