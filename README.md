@@ -170,8 +170,8 @@ See `src/utils.py` and individual experiment scripts for complete parameter list
 If you use this code, please cite:
 
 ```bibtex
-@article{dlravi2026,
-  title={Dynamical Low-Rank Approximation for Nash Equilibrium Computation in High-Dimensional ICS Security Games},
+@article{dlrne2026,
+  title={Dynamical Low-Rank Equilibrium Computation for Stochastic Games between Advanced Persistent Threats and Moving Target Defense},
   journal={Automatica},
   year={2026},
   note={Submitted}
