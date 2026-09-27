@@ -13,8 +13,9 @@ This script:
 5. Plots the truncation error curve and the singular-value spectrum.
 
 Note: The full-rank network serves as a proxy benchmark. The additive gap
-||V* - V_full||_infty = epsilon_NN is independent of r and omitted from the
-trend comparison, consistent with the experimental philosophy of §7.1.
+||V* - V_full||_infty = epsilon_NN is independent of r; as a measurable
+proxy we plot its sup-norm one-step Bellman residual as the epsilon_NN
+floor, consistent with the experimental philosophy of Sec. 5.
 """
 
 import numpy as np
@@ -100,6 +101,35 @@ class PowerSystemEnv:
         cfg = self.cfg
         return -np.sum((self.Cr @ x)**2) - cfg.ca*np.sum(a**2) - cfg.cd*np.sum(d**2)
 
+    def reward_batch(self, X: np.ndarray, A: np.ndarray, D: np.ndarray) -> np.ndarray:
+        """Batch version of reward(): X (N,n), A (N,ra), D (N,rd) -> (N,)"""
+        cfg = self.cfg
+        return -np.sum((X @ self.Cr.T)**2, axis=1) \
+               - cfg.ca*np.sum(A**2, axis=1) - cfg.cd*np.sum(D**2, axis=1)
+
+    def step_batch(self, X: np.ndarray, A: np.ndarray, D: np.ndarray) -> np.ndarray:
+        """Vectorized version of step(): X (N,n), A (N,ra), D (N,rd) -> (N,n).
+        Identical operations to step(), applied along the batch axis."""
+        cfg = self.cfg
+        # g_power, batched through the low-rank coupling subspace
+        Z = X @ self.V_coupling                                  # (N, r_coupling)
+        diff = Z[:, :, None] - Z[:, None, :]                     # (N, rc, rc)
+        nonlinear = np.sin(diff) + 0.1 * diff**2
+        s = nonlinear.sum(axis=2)                                # (N, rc)
+        x_next = X + cfg.dt * (self.Kpf @ (self.V_coupling @ s.T)).T
+        # attack channel: diag(gate) @ Ba_bar @ a
+        gate_a = 1.0 / (1.0 + np.exp(-(X - 0.5) * 10))           # (N, n)
+        x_next += gate_a * (A @ self.Ba_bar.T)
+        # defense channel: Bd_bar * softmax(W_d x), then contract with d
+        logits = X @ self.Wd.T                                   # (N, rd)
+        logits -= logits.max(axis=1, keepdims=True)
+        gate_d = np.exp(logits)
+        gate_d /= gate_d.sum(axis=1, keepdims=True)              # (N, rd)
+        x_next += (self.Bd_bar[None, :, :] * (gate_d * D)[:, None, :]).sum(axis=2)
+        # noise + saturation
+        x_next += np.random.randn(X.shape[0], cfg.n) * cfg.sigma_w
+        return np.clip(x_next, cfg.x_min, cfg.x_max)
+
     def sample_states(self, N: int) -> np.ndarray:
         samples = np.random.rand(N, self.cfg.n)
         for i in range(self.cfg.n):
@@ -168,26 +198,36 @@ def train_fullrank_baseline(env: PowerSystemEnv, n: int, m: int,
                             n_samples: int = 2000,
                             n_iters: int = 100,
                             lr: float = 0.02,
-                            gamma: float = 0.95) -> FullRankValueNN:
+                            gamma: float = 0.95,
+                            wd_scale: float = 1e-3,
+                            thresh_every: int = 10,
+                            thresh_start: int = 20,
+                            thresh_shrink: float = 0.02,
+                            thresh_protect: int = 40,
+                            protect_floor: float = 1e-3) -> FullRankValueNN:
     """
     Trains a full-rank network on synthetic Bellman targets.
     Target: y = r(x,a,d) + gamma * V(x') under random actions (bootstrapping).
+
+    Low-rank induction (spectral regularization of the benchmark):
+      (1) weight decay wd_scale applied every iteration;
+      (2) soft-thresholding of the singular spectrum every thresh_every
+          iterations after thresh_start, shrinking all singular values by
+          thresh_shrink and flooring the leading thresh_protect ones at
+          protect_floor so the signal head survives the shrinkage.
     """
     net = FullRankValueNN(n, m)
     print(f"  Training full-rank net: n={n}, m={m}, params={net.W.size + net.w_out.size}")
 
     for it in range(n_iters):
         X = env.sample_states(n_samples)
-        Y = np.zeros(n_samples)
 
-        # Compute Bellman targets with current network (single-sample MC)
-        for i in range(n_samples):
-            x = X[i]
-            a = np.random.rand(env.cfg.ra)
-            d = np.random.rand(env.cfg.rd)
-            r = env.reward(x, a, d)
-            x_next = env.step(x, a, d)
-            Y[i] = r + gamma * net.forward(x_next)
+        # Bellman targets, fully vectorized (same single-sample MC protocol)
+        A = np.random.rand(n_samples, env.cfg.ra)
+        D = np.random.rand(n_samples, env.cfg.rd)
+        R = env.reward_batch(X, A, D)
+        X_next = env.step_batch(X, A, D)
+        Y = R + gamma * net.forward_batch(X_next)
 
         # Batch forward
         G = np.tanh(X @ net.W.T)          # (N, m)
@@ -203,19 +243,16 @@ def train_fullrank_baseline(env: PowerSystemEnv, n: int, m: int,
         net.w_out -= lr * grad_w
         net.W -= lr * grad_W
 
-        # === 诱导低秩结构：更强权重衰减 + 更频繁软阈值 ===
-        # (1) 权重衰减增强50倍，更积极地压缩小权重方向
-        net.W -= lr * 1e-3 * net.W
-        
-        # (2) 每5轮执行一次（更频繁），且从第10轮开始（更早）
-        # 软阈值：每10轮压缩尾部，保护前40个主导方向
-        if it % 10 == 0 and it > 20:
+        # === spectral regularization: weight decay + soft thresholding ===
+        net.W -= lr * wd_scale * net.W
+
+        if it % thresh_every == 0 and it > thresh_start:
             U, s, Vh = svd(net.W, full_matrices=False)
-            s = np.maximum(s - 0.02, 0)
-            k = min(40, len(s))
-            s[:k] = np.maximum(s[:k], 0.001)
+            s = np.maximum(s - thresh_shrink, 0)
+            k = min(thresh_protect, len(s))
+            s[:k] = np.maximum(s[:k], protect_floor)
             net.W = U @ np.diag(s) @ Vh
-        # ================================================
+        # =================================================================
         if it % 20 == 0:
             mse = np.mean(delta**2)
             print(f"    Iter {it:3d}: MSE = {mse:.4f}")
@@ -229,13 +266,18 @@ def train_fullrank_baseline(env: PowerSystemEnv, n: int, m: int,
 def evaluate_truncation_error(V_full: FullRankValueNN,
                               env: PowerSystemEnv,
                               r_list: list,
-                              n_test: int = 5000):
+                              n_test: int = 5000,
+                              gamma: float = 0.95,
+                              n_residual: int = 500):
     """
     For each rank r in r_list:
-      - Truncate W_full via SVD to rank r.
+      - Truncate W_full via SVD to rank r (no retraining).
       - Build low-rank network V_hat_r.
       - Measure sup-norm error on test set.
       - Compute EYM error and theoretical bound.
+    Also computes the epsilon_NN floor: the sup-norm one-step Bellman
+    residual of the full-rank benchmark, below which further truncation
+    gains are meaningless.
     """
     W_full = V_full.W
     w_out = V_full.w_out
@@ -248,15 +290,35 @@ def evaluate_truncation_error(V_full: FullRankValueNN,
 
     # Test set
     X_test = env.sample_states(n_test)
-    V_full_test = np.array([V_full.forward(x) for x in X_test])
+    V_full_test = V_full.forward_batch(X_test)
+
+    # --- epsilon_NN floor: sup-norm Bellman residual of the benchmark ---
+    # MC-averaged targets (M action samples per state) to remove the
+    # single-sample target noise; the floor then isolates the benchmark's
+    # own approximation error, which is the meaningful saturation level
+    # for the truncation-error curve.
+    n_res = min(n_residual, n_test)
+    M = 32
+    resid = np.zeros(n_res)
+    for i in range(n_res):
+        x = X_test[i]
+        ys = np.zeros(M)
+        for j in range(M):
+            a = np.random.rand(env.cfg.ra)
+            d = np.random.rand(env.cfg.rd)
+            ys[j] = env.reward(x, a, d) + gamma * V_full.forward(env.step(x, a, d))
+        resid[i] = abs(V_full_test[i] - ys.mean())
+    eps_NN = float(resid.max())
 
     results = {
         'r_list': r_list,
         'measured_error': [],
         'eym_error': [],
-        'theoretical_bound': []
+        'theoretical_bound': [],
+        'eps_NN': eps_NN
     }
 
+    print(f"\n  epsilon_NN floor (Bellman residual of V_full): {eps_NN:.6f}")
     print(f"\n  {'Rank':>5s} | {'Measured':>12s} | {'EYM':>12s} | {'TheoryBound':>12s}")
     print("  " + "-"*55)
 
@@ -271,8 +333,8 @@ def evaluate_truncation_error(V_full: FullRankValueNN,
         V_hat = LowRankValueNN(env.cfg.n, env.cfg.m, r)
         V_hat.set_from_svd(U_r, s_r, Vh_r, w_out)
 
-        # Evaluate
-        V_hat_test = np.array([V_hat.forward(x) for x in X_test])
+        # Evaluate (batched forward pass)
+        V_hat_test = V_hat.forward_batch(X_test)
         err_measured = np.max(np.abs(V_full_test - V_hat_test))
 
         # EYM error
@@ -306,10 +368,16 @@ def plot_exp1(results: dict, singular_values: np.ndarray, cfg: PowerSystemConfig
                 's--', color='#A23B72', linewidth=2, markersize=8,
                 label=r'Theory: $L_\phi \|w_{\mathrm{out}}^*\|_2 R_{\mathcal{X}}\,\epsilon_{\mathrm{EYM}}(r)$')
 
+    # epsilon_NN floor: sup-norm Bellman residual of the full-rank benchmark
+    eps_NN = results.get('eps_NN', None)
+    if eps_NN is not None:
+        ax.axhline(eps_NN, color='gray', linestyle=':', linewidth=2,
+                   label=r'$\epsilon_{\mathrm{NN}}$ floor (Bellman residual of $V_{\mathrm{full}}$)')
+
     ax.set_xlabel('Truncation rank $r$', fontsize=13)
     ax.set_ylabel('Error', fontsize=13)
     ax.set_title('Low-Rank Truncation Error (Theorem 1)', fontsize=14, fontweight='bold')
-    ax.legend(fontsize=11, loc='upper right')
+    ax.legend(fontsize=10, loc='upper right')
     ax.grid(True, alpha=0.3, which='both')
     ax.set_xticks(r_list)
 
@@ -319,16 +387,29 @@ def plot_exp1(results: dict, singular_values: np.ndarray, cfg: PowerSystemConfig
     ax.semilogy(idx, singular_values, color='#F18F01', linewidth=1.5)
     ax.axvline(x=max(r_list), color='gray', linestyle='--', alpha=0.6,
                label=f'Max tested $r={max(r_list)}$')
+
+    # Spectral cliff: index of the most abrupt drop in log-sigma
+    if len(singular_values) > 2:
+        d2 = np.diff(np.log10(singular_values), 2)
+        cliff_idx = int(np.argmax(d2)) + 2          # 1-based index of the knee
+        cliff_val = singular_values[cliff_idx - 1]
+        ax.axvline(x=cliff_idx, color='#C0392B', linestyle=':', linewidth=2,
+                   label=f'Spectral cliff at $i \\approx {cliff_idx}$')
+        ax.annotate(f'$i \\approx {cliff_idx}$',
+                    xy=(cliff_idx, cliff_val), xytext=(0.55, 0.35),
+                    textcoords='axes fraction', fontsize=11, color='#C0392B',
+                    arrowprops=dict(arrowstyle='->', color='#C0392B', lw=1.2))
+
     ax.set_xlabel('Singular value index $i$', fontsize=13)
     ax.set_ylabel(r'Singular value $\sigma_i(W_{\mathrm{full}}^*)$', fontsize=13)
     ax.set_title('Singular Value Spectrum', fontsize=14, fontweight='bold')
-    ax.legend(fontsize=11)
+    ax.legend(fontsize=10)
     ax.grid(True, alpha=0.3, which='both')
 
     plt.tight_layout()
-    plt.savefig('exp1_truncation_error.png', dpi=300, bbox_inches='tight')
-    plt.show()
-    print("\n  [Plot saved to: exp1_truncation_error.png]")
+    plt.savefig('exp1_truncation_error_v3.png', dpi=300, bbox_inches='tight')
+    plt.close(fig)
+    print("\n  [Plot saved to: exp1_truncation_error_v2.png]")
 
 # ==============================================================================
 # 6. Main Entry
@@ -341,15 +422,9 @@ def main():
     print("=" * 70)
 
     cfg = PowerSystemConfig()
-    # -------------------------------------------------------------------------
-    # NOTE: For quick demonstration, n=200 is used. For full-scale validation
-    # matching the paper's design (n=1000, m=1000), simply set:
-    #   cfg.n = 1000
-    #   cfg.m = 1000
-    #   n_samples = 5000
-    #   n_iters = 200
-    #   n_test = 10000
-    # -------------------------------------------------------------------------
+    # Production scale matching the paper (n=m=1000).
+    cfg.n = 1000
+    cfg.m = 1000
     print(f"\n[Config] n={cfg.n}, m={cfg.m}, ra={cfg.ra}, rd={cfg.rd}")
 
     np.random.seed(cfg.seed)
@@ -359,17 +434,20 @@ def main():
     print("\n[Step 1] Training full-rank baseline V_full...")
     V_full = train_fullrank_baseline(
         env, cfg.n, cfg.m,
-        n_samples=2000,
-        n_iters=100,
+        n_samples=5000,
+        n_iters=200,
         lr=0.02,
-        gamma=0.95
+        gamma=0.95,
+        # spectral regularization inducing the low-rank benchmark structure
+        wd_scale=1e-2, thresh_every=5, thresh_start=30, thresh_shrink=0.05,
+        thresh_protect=200, protect_floor=0.01
     )
 
     # Step 2: Evaluate truncation errors
     print("\n[Step 2] Evaluating low-rank truncation errors...")
     r_list = [5, 10, 20, 50, 100]
     r_list = [r for r in r_list if r <= min(cfg.n, cfg.m)]
-    results, s_full = evaluate_truncation_error(V_full, env, r_list, n_test=5000)
+    results, s_full = evaluate_truncation_error(V_full, env, r_list, n_test=10000)
 
     # Step 3: Plot
     print("\n[Step 3] Generating figure...")

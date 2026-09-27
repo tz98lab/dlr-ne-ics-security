@@ -365,7 +365,7 @@ def plot_exp3(res: dict, r: int):
     theory_speedup = n_list / (r**2)  # Theta(n/r^2) reference
     ax.plot(n_list, speedup_time, 'o-', color='#2E86AB', linewidth=2, markersize=8, label='Measured (time)')
     ax.plot(n_list, speedup_flops, 's-', color='#F18F01', linewidth=2, markersize=8, label='Theoretical (FLOPs)')
-    ax.plot(n_list, theory_speedup / theory_speedup[0] * speedup_time[0], 'k--', alpha=0.5, label=r'$\Theta(n/r^2)$ reference')
+    ax.plot(n_list, theory_speedup, 'k--', alpha=0.6, label=r'$\Theta(n/r^2)$ reference')
     ax.set_xlabel('State dimension $n$', fontsize=12)
     ax.set_ylabel('Speedup ratio (FC / DLR)', fontsize=12)
     ax.set_title('Speedup over Full-Rank Baseline', fontsize=13, fontweight='bold')
