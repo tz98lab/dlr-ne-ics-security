@@ -3,15 +3,15 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-> **Dynamical Low-Rank Approximation for Nash Equilibrium Computation in High-Dimensional ICS Security Games**
+> **Dynamical Low-Rank Equilibrium Computation for Stochastic Games between Advanced Persistent Threats and Moving Target Defense**
 >
-> Submitted to *Automatica* (Long Paper)
+> Regular Paper, under review at *Automatica* (resubmitted October 2026)
 
 ## Overview
 
-This repository contains the implementation and experimental validation of the **Dynamical Low-Rank Approximate Value Iteration (DLR-NE)** algorithm for computing Nash equilibria in high-dimensional Industrial Control System (ICS) security games.
+This repository contains the implementation and experimental validation of the **Dynamical Low-Rank Nash Equilibrium (DLR-NE)** algorithm for computing Nash equilibria in high-dimensional Industrial Control System (ICS) security games.
 
-The strategic interaction between **Advanced Persistent Threats (APTs)** and **Moving Target Defenses (MTDs)** is modeled as a two-player zero-sum stochastic game over a continuous state space of dimension $n \sim 10^3$–$10^4$. The key insight is that the physical low-rank coupling of attack and defense channels (a structural property inherent to ICS network topology) enables tractable low-rank neural-network approximation of the equilibrium value function, reducing per-iteration complexity from $\mathcal{O}(n^3)$ to $\mathcal{O}(nr^2)$.
+The strategic interaction between **Advanced Persistent Threats (APTs)** and **Moving Target Defenses (MTDs)** is modeled as a two-player zero-sum stochastic game over a continuous state space of dimension $n \sim 10^3$–$10^4$. The key insight is that the physical low-rank coupling of attack and defense channels (a structural property inherent to ICS network topology) enables tractable low-rank neural-network approximation of the equilibrium value function, reducing per-iteration complexity from $\mathcal{O}(n^2)$ to $\mathcal{O}(nr^2)$, a $\Theta(n/r^2)$ speedup.
 
 ### Core Theoretical Contributions
 
@@ -27,7 +27,7 @@ The strategic interaction between **Advanced Persistent Threats (APTs)** and **M
 ## Repository Structure
 
 ```
-DLR-NE-ics-security/
+dlr-ne-ics-security/
 ├── src/                          # Core algorithmic modules
 │   ├── environment.py            # Synthetic nonlinear power-system dynamics
 │   ├── networks.py               # Low-rank and full-rank neural networks
@@ -60,8 +60,8 @@ DLR-NE-ics-security/
 
 ```bash
 # Clone the repository
-git clone https://github.com/tz98lab/DLR-NE-ics-security.git
-cd DLR-NE-ics-security
+git clone https://github.com/tz98lab/dlr-ne-ics-security.git
+cd dlr-ne-ics-security
 
 # Create a virtual environment (recommended)
 python -m venv venv
@@ -106,7 +106,7 @@ python experiments/exp02_convergence.py
 ```
 
 **Output**: `results/figures/exp2_convergence.png`  
-**Expected**: Error curves decay with slope $\approx \gamma$; larger batch size $N_b$ and inner-loop steps $s^*$ reduce the steady-state plateau.
+**Expected**: Error curves first decay along the $\gamma^k$ envelope, then bend into a plateau dominated by the inner-loop budget $s^*$ (halving $s^*$ costs a factor of $\approx 20$ in accuracy); the batch size $N_b$ has a comparatively negligible effect.
 
 ### <a name="exp3"></a> Exp. 3: Computational Complexity (Theorem 3)
 
@@ -117,11 +117,11 @@ python experiments/exp03_complexity.py
 ```
 
 **Output**: `results/figures/exp3_complexity.png`  
-**Expected**: DLR-NE scales linearly in $n$ (slope 1 in log-log), FC-NN scales quadratically (slope 2); measured speedup $\approx 20\times$ at $n=2000, r=10$.
+**Expected**: DLR-NE scales linearly in $n$ (slope 1 in log-log), FC-NN scales quadratically (slope 2); measured FLOPs speedup $\approx 12\times$ (wall-clock $\approx 4\times$) at $n=2000, r=10$.
 
 ### <a name="exp4"></a> Exp. 4: Game-Theoretic Robustness (Corollary 1)
 
-Validates the linear relation $\|V(\cdot;\pi_D,\pi_A) - V(\cdot;\tilde{\pi}_D,\pi_A)\|_\infty \le L_\kappa \|\Delta S\|_F$ and the condition-number control $L_\kappa \propto \kappa(S)$.
+Validates the linear relation $\|V(\cdot;\pi_D,\pi_A) - V(\cdot;\tilde{\pi}_D,\pi_A)\|_\infty \le L_\kappa \|\Delta S\|_F$ with a finite, $\beta$-tunable sensitivity constant $L_\kappa$ certified by the condition number $\kappa(S)$ (an a priori worst-case certificate).
 
 ```bash
 python experiments/exp04_robustness.py
@@ -139,7 +139,7 @@ python experiments/exp05_tradeoff.py
 ```
 
 **Output**: `results/figures/exp5_tradeoff.png`  
-**Expected**: Sweet spot at $r \sim 10$–$20$ where compression $> 95\%$ and utility loss $< 5\%$.
+**Expected**: Sweet spot at $r = 5$: $\approx 94\%$ parameter compression at $\approx 2.3\%$ utility loss.
 
 ### <a name="exp6"></a> Exp. 6: Ablation—Necessity of Basis Augmentation
 
@@ -161,7 +161,7 @@ Key hyperparameters:
 - Activation: $\tanh$ ($L_\phi = 1$)
 - Batch size: $N_b = 512$ (LHS)
 - Inner-loop steps: $s^* = 10$
-- Spectral regularization: $\beta = 0.01$ (default)
+- Spectral regularization: $\beta = 0.1$ (default)
 
 See `src/utils.py` and individual experiment scripts for complete parameter lists.
 
@@ -172,9 +172,10 @@ If you use this code, please cite:
 ```bibtex
 @article{dlrne2026,
   title={Dynamical Low-Rank Equilibrium Computation for Stochastic Games between Advanced Persistent Threats and Moving Target Defense},
+  author={Tian, Zijian and Zhang, He and Chen, Xinjie and Wang, Wenhai and Liu, Xinggao},
   journal={Automatica},
   year={2026},
-  note={Submitted}
+  note={Under review}
 }
 ```
 
@@ -186,3 +187,4 @@ This project is licensed under the MIT License. See [LICENSE](LICENSE) for detai
 
 For questions regarding the code or experiments, please open an issue on GitHub.
 For questions regarding the theoretical content, please refer to the manuscript submitted to *Automatica*.
+
